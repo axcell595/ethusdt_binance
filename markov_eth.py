@@ -381,6 +381,15 @@ def main() -> None:
         hmm["hit_rate"], hmm["sharpe"], len(hmm["strat"]))
     )
 
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10,5))
+        (mc["strat_net"].cumsum().plot(label="Markov"))
+        (hmm["strat"].cumsum().plot(label="HMM"))
+        plt.legend(); plt.title("Equity Curve (Test, Strided)")
+        plt.show()
+    except ImportError:
+        pass
 
 if __name__ == "__main__":
     main()
