@@ -1,451 +1,386 @@
-import ccxt
-import pandas as pd
-import numpy as np
-import requests
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Production-grade Markov + HMM ETH/USDT research script (Binance).
+Implements:
+- Deterministic seeding
+- Robust OHLCV + OI fetching with pagination/backoff
+- Strict timestamp alignment (INNER JOIN)
+- Features: ret, rv, dOI
+- Correct H-step forward return alignment (t -> sum of t+1..t+H)
+- Markov chain with rolling in-window quantile bins (no leakage), Laplace prior + identity mix, numeric floors
+- Non-overlapping, strided backtest with fee/turnover
+- HMM on robust-scaled features; regime -> E[fwd_ret_H|regime] learned on train
+- Diagnostics/guards
+"""
+
+from __future__ import annotations
+import os
 import time
-import json
-from datetime import datetime, timedelta, timezone
+import math
+import random
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
-from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+import requests
+import ccxt
 from hmmlearn.hmm import GaussianHMM
-import warnings
-import matplotlib.pyplot as plt # Included for diagnostic plotting
+from sklearn.preprocessing import RobustScaler
 
-# Suppress sklearn convergence warnings for HMM
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# ==============================================================================
-# 0. CONFIGURATION & PARAMETERS
-# ==============================================================================
-
+# ==============================
+# 0) CONFIG
+# ==============================
 @dataclass
-class Config:
-    # Data Acquisition
-    exchange_id: str = 'binance'
-    symbol_ohlcv: str = 'ETH/USDT'
-    symbol_oi: str = 'ETHUSDT'       # Binance Futures symbol format
-    tf: str = '15m'                  # Timeframe
-    lookback_days: int = 180         # Total data to fetch (increased for robustness)
-    oi_coverage_min: float = 0.8     # Minimum required Open Interest coverage ratio (e.g., 80%)
+class Cfg:
+    exchange_id: str = "binance"
+    symbol_ohlcv: str = "ETH/USDT"
+    symbol_oi: str = "ETHUSDT"
+    tf: str = "15m"
+    lookback_days: int = 120
 
-    # Markov Chain Parameters
-    k_states: int = 3                # Number of states for return discretization (e.g., Down, Flat, Up)
-    w_window: int = 2000             # Rolling window size in bars for MC training
-    h_horizon: int = 4               # Prediction horizon (e.g., 4x15m = 1 hour). Used as stride for backtest.
-    smoothing_alpha: float = 1.0     # Laplace smoothing alpha
-    smoothing_lambda: float = 0.05   # Mixing with Identity factor for T^H stability (e.g., 0.01 to 0.1)
-    edge_tau: float = 0.02           # Divisor (tau) for continuous signal sizing
-    rv_cap_percentile: int = 90      # Volatility cap: do not trade if RV is above this percentile (from training data)
+    # Markov
+    k_states: int = 3
+    w_window: int = 2000
+    h_horizon: int = 4
+    laplace_alpha: float = 1.0
+    identity_lambda: float = 0.05
+    edge_tau: float = 0.02  # sizing divisor (pos = clip(edge/tau, -1, 1))
+    rv_gate_percentile: float = 0.80  # trade only if rv < percentile(train)
 
-    # HMM Parameters
-    hmm_n_components: int = 3        # Number of hidden states
-    test_split_ratio: float = 0.3    # Ratio of data to reserve for out-of-sample testing
-    seed: int = 42                   # Global random seed for reproducibility
+    # HMM
+    hmm_components: int = 3
+    test_split_ratio: float = 0.30
 
-cfg = Config()
+    # Costs & limits
+    fee_per_side: float = 0.0004  # 4 bps per side
+    request_timeout: int = 20
 
-# Set seeds for reproducibility
+    # Seeds/limits
+    seed: int = 42
+    max_retries: int = 6
+
+
+cfg = Cfg()
+
+# Determinism
+random.seed(cfg.seed)
 np.random.seed(cfg.seed)
 
-# Calculate derived constants
-BARS_PER_HOUR = 60 / int(cfg.tf.replace('m', ''))
-BARS_PER_DAY = BARS_PER_HOUR * 24
-BARS_PER_YEAR = int(365.25 * BARS_PER_DAY)
-# Factor to annualize Sharpe ratio from H-step non-overlapping returns
-SHARPE_ANNUAL_FACTOR = np.sqrt(BARS_PER_YEAR / cfg.h_horizon)
-print(f"Annualization Factor (sqrt(BarsPerYear/H)): {SHARPE_ANNUAL_FACTOR:.2f}")
+# Annualization factor for 15m bars
+ANNUAL_FACTOR = int((60 / 15) * 24 * 365)  # 35040
 
+# ==============================
+# 1) EXCHANGE INIT
+# ==============================
 
-# ==============================================================================
-# 1. DATA FETCHING UTILITIES
-# ==============================================================================
-
-def initialize_exchange(exchange_id):
-    """Initializes the exchange client."""
+def init_exchange(exchange_id: str) -> ccxt.Exchange:
     try:
-        # Use low default rate limit as a precaution
-        exchange = getattr(ccxt, exchange_id)({'enableRateLimit': True, 'rateLimit': 500})
-        print(f"Initialized {exchange_id} exchange.")
-        return exchange
-    except AttributeError:
-        print(f"Error: Exchange ID '{exchange_id}' not supported by CCXT.")
-        return None
-
-EXCHANGE = initialize_exchange(cfg.exchange_id)
-if not EXCHANGE:
-    raise SystemExit("Exiting due to failed exchange initialization.")
+        ex = getattr(ccxt, exchange_id)({
+            "enableRateLimit": True,
+            "rateLimit": 500,
+        })
+        return ex
+    except AttributeError as e:
+        raise SystemExit(f"Unsupported exchange: {exchange_id}") from e
 
 
-def fetch_ohlcv_historical(symbol, timeframe, start_dt, limit=1000):
-    """Fetches OHLCV data spanning the required lookback period."""
-    print(f"Fetching OHLCV data for {symbol}...")
+EXCHANGE = init_exchange(cfg.exchange_id)
+
+# ==============================
+# 2) DATA FETCHING
+# ==============================
+
+def fetch_ohlcv(symbol: str, timeframe: str, start_dt: datetime, limit: int = 1000) -> pd.DataFrame:
+    """Fetches historical OHLCV using CCXT public endpoints."""
     since_ms = int(start_dt.timestamp() * 1000)
-    all_rows = []
-    
+    out = []
     while True:
         try:
             batch = EXCHANGE.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-            print(f"Warning: Failed to fetch batch. Retrying in 5s. Error: {e}")
             time.sleep(5)
             continue
-        
-        if not batch: break
-        
-        # Avoid duplicate data points and ensure progression
-        since_ms = batch[-1][0] + 1 
-        all_rows += batch
-        
-        if len(batch) < limit: break
-        
-    df = pd.DataFrame(all_rows, columns=['ts','open','high','low','close','volume'])
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
-    df.set_index('ts', inplace=True)
-    df = df.drop_duplicates().sort_index()
-    print(f"Fetched {len(df)} OHLCV bars.")
+        if not batch:
+            break
+        out.extend(batch)
+        since_ms = batch[-1][0] + 1
+        if len(batch) < limit:
+            break
+    df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])\
+            .assign(ts=lambda d: pd.to_datetime(d["ts"], unit="ms", utc=True))\
+            .drop_duplicates().sort_values("ts").set_index("ts")
     return df
 
 
-def fetch_open_interest_historical(symbol, interval, start_dt, limit=500):
-    """Fetches historical Binance Futures Open Interest data using robust pagination (backward traversal)."""
-    print(f"Fetching Open Interest data for {symbol}...")
+def fetch_open_interest(symbol: str, interval: str, start_dt: datetime) -> pd.DataFrame:
+    """Paginate Binance futures OI (max 500 per call). Reverse from now to start."""
     url = "https://fapi.binance.com/futures/data/openInterestHist"
-    
-    all_rows = []
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = int(start_dt.timestamp() * 1000)
+    all_records: list[dict] = []
+    seen = set()
     retries = 0
-
-    while True:
-        params = {"symbol": symbol, "period": interval, "limit": limit, "endTime": end_ms}
-        
+    while end_ms > start_ms and retries <= cfg.max_retries:
+        params = {"symbol": symbol, "period": interval, "limit": 500, "endTime": end_ms}
         try:
-            r = requests.get(url, params=params, timeout=20)
+            r = requests.get(url, params=params, timeout=cfg.request_timeout)
             r.raise_for_status()
-            data = r.json()
-            retries = 0 # Reset retries on success
-
-            if not data:
-                break
-            
-            # Filter batch to keep only records newer than the start time
-            batch = [row for row in data if row['timestamp'] >= start_ms]
-            
+            batch = r.json()
             if not batch:
-                # If the entire batch is older than the start time, we're done
                 break
-
-            all_rows.extend(batch)
-            
-            # Move cursor to the timestamp immediately before the oldest record in this batch
-            end_ms = data[-1]['timestamp'] - 1
-            
-            # Respect Binance rate limit (1200 req/min = 50ms/req, use 120ms to be safe)
-            time.sleep(0.12)
-
+            # dedupe
+            added = 0
+            for it in batch:
+                ts = it["timestamp"]
+                if ts not in seen:
+                    seen.add(ts)
+                    all_records.append(it)
+                    added += 1
+            # step older
+            end_ms = batch[-1]["timestamp"] - 1
+            # gentle rate limit
+            time.sleep(max(0.001, EXCHANGE.rateLimit / 1000))
+            retries = 0
         except requests.exceptions.HTTPError as e:
-            if r.status_code == 429 and retries < 5:
-                print(f"Rate limit hit (429). Exponential backoff: {2**retries}s")
-                time.sleep(2**retries)
+            status = r.status_code if "r" in locals() else None
+            if status == 429:
+                delay = 2 ** retries
+                time.sleep(delay)
                 retries += 1
+                continue
             else:
-                print(f"HTTP Error or too many retries: {e}. Stopping OI fetch.")
                 break
-        except requests.exceptions.RequestException as e:
-            print(f"Warning: Failed to fetch OI batch. Error: {e}. Stopping OI fetch.")
-            break
-            
-    if not all_rows:
-        print("Warning: Could not fetch any Open Interest data.")
-        return pd.DataFrame({'sumOpenInterest': []})
+        except requests.exceptions.RequestException:
+            delay = min(2 ** retries, 60)
+            time.sleep(delay)
+            retries += 1
+            continue
+    if not all_records:
+        return pd.DataFrame(columns=["sumOpenInterest"]).astype({"sumOpenInterest": float})
+    d = pd.DataFrame(all_records)
+    d["timestamp"] = pd.to_datetime(d["timestamp"], unit="ms", utc=True)
+    d = d[["timestamp", "sumOpenInterest"]]
+    d["sumOpenInterest"] = d["sumOpenInterest"].astype(float)
+    d = d.drop_duplicates().sort_values("timestamp").set_index("timestamp")
+    return d
 
-    df = pd.DataFrame(all_rows)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    df['sumOpenInterest'] = df['sumOpenInterest'].astype(float)
-    df = df.set_index('timestamp')['sumOpenInterest']
-    
-    df = df.sort_index().drop_duplicates()
-    print(f"Fetched {len(df)} Open Interest bars.")
-    return df
+# ==============================
+# 3) FEATURE ENGINEERING
+# ==============================
 
+def build_features(df_ohlcv: pd.DataFrame, df_oi: pd.DataFrame) -> pd.DataFrame:
+    # strict alignment
+    df = df_ohlcv.join(df_oi, how="inner")
+    if len(df) < 1000:
+        raise SystemExit("Insufficient aligned bars after INNER JOIN.")
 
-# ==============================================================================
-# 2. DATA ACQUISITION & FEATURE ENGINEERING
-# ==============================================================================
+    # returns & volatility
+    df["ret"] = np.log(df["close"]).diff()
+    df["rv"] = df["ret"].rolling(20).std() * math.sqrt(ANNUAL_FACTOR)
 
-END_DT = datetime.now(timezone.utc)
-START_DT = END_DT - timedelta(days=cfg.lookback_days)
+    # OI change (clipped)
+    df["dOI"] = df["sumOpenInterest"].pct_change().clip(-0.2, 0.2)
 
-# 2.1. Fetch data
-df_ohlcv = fetch_ohlcv_historical(cfg.symbol_ohlcv, cfg.tf, START_DT)
-df_oi = fetch_open_interest_historical(cfg.symbol_oi, cfg.tf, START_DT)
+    # correct forward H-step return: sum of next H bars
+    df["fwd_ret_H"] = df["ret"].shift(-1).rolling(cfg.h_horizon).sum()
 
-# 2.2. Sanity check OI coverage
-oi_coverage = len(df_oi.index.intersection(df_ohlcv.index)) / len(df_ohlcv)
-if oi_coverage < cfg.oi_coverage_min:
-    raise SystemExit(f"Low OI coverage: {oi_coverage:.1%}. Must be > {cfg.oi_coverage_min:.1%}. Aborting.")
-else:
-    print(f"OI coverage sufficient: {oi_coverage:.1%}.")
+    return df.dropna()
 
-# 2.3. Join and Feature Engineer
-df = df_ohlcv.copy()
-# Strict inner join ensures OHLCV and OI data are present for the bar
-df = df.join(df_oi, how='inner') 
+# ==============================
+# 4) MARKOV CHAIN
+# ==============================
 
-# Log returns
-df['ret'] = np.log(df['close']).diff()
-# Annualization factor for 15m
-df['rv'] = df['ret'].rolling(20).std() * np.sqrt(BARS_PER_YEAR) 
-
-# Open Interest feature: clipped percentage change
-df['dOI'] = df['sumOpenInterest'].pct_change().clip(-0.2, 0.2).fillna(0)
-
-# CORRECT H-step forward log-return starting at t (next H bars)
-df['fwd_ret_H'] = df['ret'].rolling(cfg.h_horizon).sum().shift(-cfg.h_horizon)
-
-# Final cleanup after all feature calculations (removes NaNs from diff/rolling/shift)
-df_features = df[['ret', 'rv', 'dOI', 'fwd_ret_H']].dropna() 
-print(f"\nTotal bars available for modeling: {len(df_features)}")
-
-# Define train/test splits based on the cleaned feature dataframe
-N_TOTAL = len(df_features)
-N_TEST = int(N_TOTAL * cfg.test_split_ratio)
-N_TRAIN = N_TOTAL - N_TEST
-
-# Indices for splitting
-IDX_ALL = df_features.index
-IDX_TRAIN = IDX_ALL[:N_TRAIN]
-IDX_TEST = IDX_ALL[N_TRAIN:]
-
-# === Guard Clause: Check if enough training data exists for MC window ===
-if N_TRAIN < cfg.w_window:
-    raise SystemExit(f"Training bars ({N_TRAIN}) is less than Markov window ({cfg.w_window}). Increase LOOKBACK_DAYS or decrease W_WINDOW.")
-
-print(f"Training bars: {N_TRAIN}, Testing bars: {N_TEST}")
-print(f"Train Date Range: {IDX_TRAIN[0].date()} to {IDX_TRAIN[-1].date()}")
-print(f"Test Date Range: {IDX_TEST[0].date()} to {IDX_TEST[-1].date()}")
+def trans_mat_from_states(states: np.ndarray, K: int, alpha: float, lam: float) -> np.ndarray:
+    """Laplace-smoothed transition matrix with identity mixing and numeric floor."""
+    C = np.full((K, K), alpha, dtype=float)
+    # counts
+    for a, b in zip(states[:-1], states[1:]):
+        C[a, b] += 1.0
+    T = C / C.sum(1, keepdims=True)
+    T = (1 - lam) * T + lam * np.eye(K)
+    T = np.maximum(T, 1e-12)
+    T = T / T.sum(1, keepdims=True)
+    return T
 
 
-# ==============================================================================
-# 3. MARKOV CHAIN (MC) STRATEGY
-# ==============================================================================
+def markov_walk_forward(df_feat: pd.DataFrame, idx_train: pd.DatetimeIndex, idx_test: pd.DatetimeIndex) -> dict:
+    K = cfg.k_states
+    W = cfg.w_window
+    H = cfg.h_horizon
 
-def trans_mat(s, K_states, alpha, lambd):
-    """
-    Calculates the KxK Markov transition matrix with Laplace smoothing 
-    and mixing with the Identity matrix (I) for stability.
-    """
-    I = np.eye(K_states)
-    
-    # 1. Laplace Smoothing (Dirichlet Prior)
-    T = np.full((K_states, K_states), alpha)
-    for a,b in zip(s[:-1], s[1:]): 
-        T[a,b] += 1
-        
-    T_prior = T / np.clip(T.sum(axis=1, keepdims=True), 1, None)
-    
-    # 2. Mixing with Identity Matrix
-    T_mixed = (1 - lambd) * T_prior + lambd * I
-    
-    # 3. Final normalization 
-    T_final = T_mixed / T_mixed.sum(axis=1, keepdims=True)
-    return T_final
+    signals = []
+    edges = []
+    p_up_list = []
+    ts_exec = []
 
+    # rv gate learned on train
+    rv_cap = df_feat.loc[idx_train, "rv"].quantile(cfg.rv_gate_percentile)
 
-def run_markov_chain_strategy(df_features, states_all, q_cutoffs, rv_cap, cfg):
-    """Runs the walk-forward Markov Chain strategy."""
+    # stride test by H for non-overlap
+    test_ts_strided = idx_test[:-H: H].copy()
 
-    print(f"\n--- Running Markov Chain Strategy (W={cfg.w_window}, H={cfg.h_horizon}) ---")
-    
-    signals_mc = []
-    start_bar_index = N_TRAIN
-    
-    # Loop over the test set, using a stride of H_HORIZON for non-overlapping trades
-    # Start loop at the beginning of the test set, step by H_HORIZON
-    loop_range = range(start_bar_index, N_TOTAL - cfg.h_horizon, cfg.h_horizon)
-    for j, i in enumerate(loop_range):
-        # Training window: W bars *before* bar i
-        s_win = states_all[i - cfg.w_window : i]
-        
-        # Assert W_WINDOW length
-        assert len(s_win) == cfg.w_window, "MC window length mismatch."
-        
-        # Calculate and stabilize transition matrix T
-        T = trans_mat(s_win, cfg.k_states, cfg.smoothing_alpha, cfg.smoothing_lambda)
-        
-        # Apply numeric floor and re-normalize before powering (stability)
-        T = np.maximum(T, 1e-9)
-        T = T / T.sum(axis=1, keepdims=True)
-        
-        # Calculate the H-step ahead transition matrix: T^H
-        Th = np.linalg.matrix_power(T, cfg.h_horizon)
-        
-        # Current state is the state at bar i
-        cur = states_all[i]
-        e = np.eye(cfg.k_states)[cur] 
-        probs = e @ Th 
-        
-        p_up = probs[cfg.k_states-1]
-        p_down = probs[0]
+    for t in test_ts_strided:
+        # ensure we have W bars of history ending at t (exclusive)
+        pos = df_feat.index.get_indexer_for([t])[0]
+        if pos - W < 0:
+            continue
+        win_slice = slice(pos - W, pos)
+        r_win = df_feat["ret"].iloc[win_slice]
 
-        # Continuous trading rule: size position based on edge/tau
-        edge = p_up - p_down
-        sig = np.clip(edge / cfg.edge_tau, -1, 1) # Position size between -1 and +1
+        # in-window rolling quantile bins (no leakage)
+        qcuts = r_win.quantile([1 / K, 2 / K]).values
+        s_win = np.clip(np.digitize(r_win.values, qcuts), 0, K - 1)
 
-        # Volatility Gating: Flat signal if realized volatility is too high
-        current_rv = df_features['rv'].iloc[i]
-        if current_rv > rv_cap:
-            sig = 0 # Gate the trade
-        
-        signals_mc.append(sig)
+        # current state at time t using same window cutoffs
+        r_t = df_feat.at[t, "ret"]
+        cur_state = int(np.clip(np.digitize([r_t], qcuts)[0], 0, K - 1))
 
-    # Filter the index to match the strided walk-forward loop
-    idx_mc_test_strided = IDX_ALL[start_bar_index : N_TOTAL - cfg.h_horizon : cfg.h_horizon]
-    sig_mc = pd.Series(signals_mc, index=idx_mc_test_strided, name='sig_mc')
+        T = trans_mat_from_states(s_win, K, cfg.laplace_alpha, cfg.identity_lambda)
+        Th = np.linalg.matrix_power(T, H)
+        e = np.eye(K)[cur_state]
+        probs = e @ Th
+        p_up, p_down = probs[K - 1], probs[0]
+        edge = float(p_up - p_down)
 
-    # Next H-step return *already compounded* from the 'fwd_ret_H' column
-    fwd_ret_mc = df_features['fwd_ret_H'].reindex(idx_mc_test_strided)
-    strat_ret_mc = sig_mc * fwd_ret_mc
+        # rv gate
+        if df_feat.at[t, "rv"] >= rv_cap:
+            sig = 0.0
+        else:
+            sig = float(np.clip(edge / cfg.edge_tau, -1.0, 1.0))
 
-    perf_mc = pd.DataFrame({'ret': fwd_ret_mc, 'strat': strat_ret_mc}).dropna()
-    
-    return perf_mc
+        signals.append(sig)
+        edges.append(edge)
+        p_up_list.append(float(p_up))
+        ts_exec.append(t)
 
+    sig = pd.Series(signals, index=pd.DatetimeIndex(ts_exec), name="sig_mc").astype(float)
+    edge_series = pd.Series(edges, index=sig.index, name="edge")
+    p_up_series = pd.Series(p_up_list, index=sig.index, name="p_up")
 
-# --- 3.1 Discretize returns using only Training Set quantiles (Frozen Bins) ---
-ret_train = df_features['ret'].loc[IDX_TRAIN]
-quantiles = [i/cfg.k_states for i in range(1, cfg.k_states)] 
-q_cutoffs = ret_train.quantile(quantiles).values 
+    # Non-overlapping H-step returns
+    fwd = df_feat["fwd_ret_H"].reindex(sig.index)
+    strat = (sig * fwd).dropna()
 
-print(f"MC Quantile Cutoffs (used to define states): {q_cutoffs}")
+    # Fees via turnover on rebalancing (per stride)
+    turnover = sig.diff().abs().fillna(0).sum()
+    net = strat - cfg.fee_per_side * turnover / max(len(strat), 1)
 
-# Redefine states using frozen quantiles and clipping for all data
-states_all = np.clip(
-    np.digitize(df_features['ret'].values, q_cutoffs), 
-    0, cfg.k_states - 1
-)
+    sharpe = np.nan
+    if strat.std() > 0:
+        sharpe = strat.mean() / strat.std() * math.sqrt(ANNUAL_FACTOR / H)
 
-# --- 3.2 Volatility Gating Threshold ---
-rv_train = df_features['rv'].loc[IDX_TRAIN]
-rv_cap = np.percentile(rv_train.dropna(), cfg.rv_cap_percentile)
-print(f"Volatility Cap (RV > {rv_cap:.4f} annualized) will result in a flat signal (0).")
+    hit = (np.sign(strat) == np.sign(fwd.reindex(strat.index))).mean() if len(strat) else np.nan
 
+    return {
+        "signals": sig,
+        "edge": edge_series,
+        "p_up": p_up_series,
+        "strat": strat,
+        "strat_net": net,
+        "turnover": float(turnover),
+        "hit_rate": float(hit) if not math.isnan(hit) else np.nan,
+        "sharpe": float(sharpe) if not math.isnan(sharpe) else np.nan,
+    }
 
-# --- 3.3 Run and Evaluate MC Performance ---
-perf_mc = run_markov_chain_strategy(df_features, states_all, q_cutoffs, rv_cap, cfg)
+# ==============================
+# 5) HMM REGIME MODEL
+# ==============================
 
+def hmm_regime(df_feat: pd.DataFrame, idx_train: pd.DatetimeIndex, idx_test: pd.DatetimeIndex) -> dict:
+    H = cfg.h_horizon
+    X_all = df_feat[["ret", "rv", "dOI"]].copy()
+    Y_all = df_feat["fwd_ret_H"].copy()
 
-# ==============================================================================
-# 4. HIDDEN MARKOV MODEL (HMM) STRATEGY
-# ==============================================================================
+    X_tr, X_te = X_all.loc[idx_train], X_all.loc[idx_test]
+    Y_tr, Y_te = Y_all.loc[idx_train], Y_all.loc[idx_test]
 
-def run_hmm_strategy(df_features, cfg):
-    """Fits HMM on training data and evaluates on test data (strided)."""
+    scaler = RobustScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_te_s = scaler.transform(X_te)
 
-    X_all = df_features[['ret', 'rv', 'dOI']].copy()
-    Y_all = df_features['fwd_ret_H'].copy() 
+    hmm = GaussianHMM(
+        n_components=cfg.hmm_components,
+        covariance_type="full",
+        n_iter=200,
+        random_state=cfg.seed,
+        min_covar=1e-6,
+    )
+    hmm.fit(X_tr_s)
 
-    # Split and Scale
-    X_tr = X_all.loc[IDX_TRAIN]
-    X_te = X_all.loc[IDX_TEST]
-    Y_tr = Y_all.loc[IDX_TRAIN]
+    # Regimes
+    reg_tr = hmm.predict(X_tr_s)
+    reg_te = hmm.predict(X_te_s)
 
-    scaler = StandardScaler()
-    X_tr_scaled = scaler.fit_transform(X_tr)
-    X_te_scaled = scaler.transform(X_te)
+    mu_by_reg = pd.Series(Y_tr.values).groupby(reg_tr).mean()
+    mu_hat = pd.Series(reg_te, index=idx_test).map(mu_by_reg).rename("mu_hat")
 
-    # Fit HMM
-    print(f"\n--- Fitting HMM with {cfg.hmm_n_components} Components on Training Data ---")
-    hmm = GaussianHMM(n_components=cfg.hmm_n_components, 
-                      covariance_type='full', 
-                      n_iter=200, 
-                      random_state=cfg.seed, 
-                      min_covar=1e-6)
-    hmm.fit(X_tr_scaled)
+    # Strided evaluation to avoid overlap
+    te_strided = idx_test[:-H: H]
+    sig = np.sign(mu_hat.reindex(te_strided)).fillna(0.0)
+    fwd = Y_all.reindex(te_strided)
+    strat = (sig * fwd).dropna()
 
-    if hmm.monitor_.converged:
-        print("HMM converged successfully.")
-    else:
-        print("HMM did NOT converge after max iterations.")
+    sharpe = np.nan
+    if strat.std() > 0:
+        sharpe = strat.mean() / strat.std() * math.sqrt(ANNUAL_FACTOR / H)
+    hit = (np.sign(strat) == np.sign(fwd.reindex(strat.index))).mean() if len(strat) else np.nan
 
-    # Decode Regimes (Test Set)
-    reg_te = hmm.predict(X_te_scaled)
+    return {
+        "signals": sig,
+        "strat": strat,
+        "hit_rate": float(hit) if not math.isnan(hit) else np.nan,
+        "sharpe": float(sharpe) if not math.isnan(sharpe) else np.nan,
+    }
 
-    # Map Regime to Expected Return (H-step forward target from training data)
-    reg_tr = hmm.predict(X_tr_scaled)
-    mu_by_reg = pd.Series(Y_tr.values).groupby(reg_tr).mean() 
-    mu_hat = pd.Series(reg_te, index=IDX_TEST).map(mu_by_reg).rename('mu_hat')
-    
-    # Signal is long/short based on the expected H-step return sign
-    signal_hmm = np.sign(mu_hat).fillna(0)
+# ==============================
+# 6) MAIN
+# ==============================
 
-    # Evaluate HMM Performance on Test Set (Strided)
-    idx_hmm_test_strided = IDX_TEST[::cfg.h_horizon]
+def main() -> None:
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=cfg.lookback_days)
 
-    signal_hmm_strided = signal_hmm.reindex(idx_hmm_test_strided)
-    fwd_ret_te_strided = Y_all.reindex(idx_hmm_test_strided)
+    df_ohlcv = fetch_ohlcv(cfg.symbol_ohlcv, cfg.tf, start_dt)
+    df_oi = fetch_open_interest(cfg.symbol_oi, cfg.tf, start_dt)
 
-    strat_ret_hmm = signal_hmm_strided * fwd_ret_te_strided
-    perf_hmm = pd.DataFrame({'ret': fwd_ret_te_strided, 'strat': strat_ret_hmm}).dropna()
-    
-    return perf_hmm
+    # Coverage diagnostic
+    inter = df_ohlcv.index.intersection(df_oi.index)
+    coverage = len(inter) / max(1, len(df_ohlcv))
+    if coverage < 0.8:
+        raise SystemExit(f"Low OI coverage vs OHLCV: {coverage:.1%}. Shorten lookback or improve pagination.")
 
+    df_feat = build_features(df_ohlcv, df_oi)
 
-perf_hmm = run_hmm_strategy(df_features, cfg)
+    # Train/test split AFTER feature dropna so indices align
+    n = len(df_feat)
+    n_test = int(n * cfg.test_split_ratio)
+    n_train = n - n_test
 
+    idx_all = df_feat.index
+    idx_train = idx_all[:n_train]
+    idx_test = idx_all[n_train:]
 
-# ==============================================================================
-# 5. DIAGNOSTICS AND RESULTS
-# ==============================================================================
+    if n_train < cfg.w_window + 10:
+        raise SystemExit("Training set too small relative to Markov window. Adjust lookback/W.")
 
-def calculate_results(perf_df, strategy_name):
-    """Calculates and prints final backtest metrics."""
-    results = {}
-    
-    if perf_df.empty:
-        print(f"\n--- {strategy_name} Performance: No trading observations found. ---")
-        return results
+    # Report ranges
+    print(f"Train range: {idx_train[0].date()} -> {idx_train[-1].date()}  (n={n_train})")
+    print(f"Test  range: {idx_test[0].date()} -> {idx_test[-1].date()}  (n={n_test})")
 
-    sharpe = perf_df['strat'].mean() / perf_df['strat'].std() * SHARPE_ANNUAL_FACTOR
-    hit_rate = (np.sign(perf_df['strat']) == np.sign(perf_df['ret'])).mean()
-    
-    print(f"\n--- {strategy_name} Out-of-Sample Performance (Test Set, Strided H={cfg.h_horizon}) ---")
-    print(f"Test Period: {perf_df.index[0].date()} to {perf_df.index[-1].date()}")
-    print(f"Hit-rate: {hit_rate:.4f}")
-    print(f"Sharpe (Annualized): {sharpe:.4f}")
+    # Markov
+    mc = markov_walk_forward(df_feat, idx_train, idx_test)
+    print("\n[Markov] hit=%.4f sharpe=%.4f turnover=%.2f bars=%d" % (
+        mc["hit_rate"], mc["sharpe"], mc["turnover"], len(mc["strat"]))
+    )
 
-    results['name'] = strategy_name
-    results['sharpe'] = sharpe
-    results['hit_rate'] = hit_rate
-    results['test_start'] = str(perf_df.index[0].date())
-    results['test_end'] = str(perf_df.index[-1].date())
-    
-    # Plotting for quick sanity check (requires interactive environment)
-    # try:
-    #     perf_df[['ret', 'strat']].cumsum().plot(
-    #         title=f'{strategy_name} Equity Curve (Test, Strided)',
-    #         figsize=(10, 6)
-    #     )
-    #     plt.show()
-    # except Exception as e:
-    #     # Print exception if plotting fails
-    #     # print(f"Plotting failed: {e}")
-    #     pass
-
-    return results
+    # HMM
+    hmm = hmm_regime(df_feat, idx_train, idx_test)
+    print("[HMM]    hit=%.4f sharpe=%.4f bars=%d" % (
+        hmm["hit_rate"], hmm["sharpe"], len(hmm["strat"]))
+    )
 
 
-mc_results = calculate_results(perf_mc, "Markov Chain")
-hmm_results = calculate_results(perf_hmm, "Hidden Markov Model")
-
-final_summary = {
-    'config': cfg.__dict__,
-    'markov_chain': mc_results,
-    'hmm': hmm_results
-}
-
-# Print full results dictionary (for consumption by environment)
-print("\n--- FINAL SUMMARY (JSON) ---")
-print(json.dumps(final_summary, indent=4))
+if __name__ == "__main__":
+    main()
